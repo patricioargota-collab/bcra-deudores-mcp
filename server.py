@@ -24,6 +24,10 @@ BASE = "https://api.bcra.gob.ar/CentralDeDeudores/v1.0"
 TIMEOUT = 25.0
 UA = "DGR-Tucuman-AsesoriaLegal/1.0 (MCP; contacto institucional)"
 
+# CUIT sintacticamente valido (11 digitos, DV correcto) pero inexistente.
+# Se usa unicamente como sonda del health-check: no corresponde a persona real.
+CUIT_SONDA = "20000000001"
+
 mcp = FastMCP(
     "BCRA Central de Deudores",
     host="0.0.0.0",
@@ -73,6 +77,37 @@ def _get(path: str) -> dict:
         return r.json()
     except Exception:
         return {"_error": "Respuesta no interpretable como JSON.", "_detalle": r.text[:400], "_url": url}
+
+
+def _probe(path: str) -> dict:
+    """Request crudo usado SOLO por el health-check.
+
+    A diferencia de _get, no colapsa la respuesta en un dict de error: preserva
+    el codigo HTTP y la latencia, que es lo que permite distinguir 'el BCRA
+    contesto y rechazo el parametro' (servicio arriba) de 'el BCRA no contesta'
+    (servicio caido).
+    """
+    url = f"{BASE}/{path}"
+    try:
+        with httpx.Client(timeout=TIMEOUT, verify=True, follow_redirects=True) as c:
+            r = c.get(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    except httpx.TimeoutException as e:
+        return {"_url": url, "_status": None, "_fallo": "timeout", "_detalle": str(e)}
+    except httpx.HTTPError as e:
+        return {"_url": url, "_status": None, "_fallo": "conexion", "_detalle": str(e)}
+
+    try:
+        cuerpo = r.json()
+    except Exception:
+        cuerpo = {"_texto": r.text[:400]}
+
+    return {
+        "_url": url,
+        "_status": r.status_code,
+        "_fallo": None,
+        "_latencia_ms": int(r.elapsed.total_seconds() * 1000),
+        "_cuerpo": cuerpo,
+    }
 
 
 def _fmt_monto(monto: Any) -> dict:
@@ -152,15 +187,52 @@ def bcra_estado() -> dict:
     """Health-check del conector: verifica que la API del BCRA responda.
 
     Usar antes de una serie de consultas, en la linea de tfn_estado / ca_estado_indice.
-    No consulta datos de ninguna persona: usa una identificacion de prueba invalida
-    a proposito para comprobar unicamente que el servicio contesta.
+    No consulta datos de ninguna persona: usa un CUIT de sonda inexistente para
+    comprobar unicamente que el servicio contesta.
+
+    Criterio: el servicio se considera DISPONIBLE si el BCRA responde cualquier
+    codigo por debajo de 500, incluidos 400 y 404 (el servidor esta operativo y
+    aplicando sus propias validaciones). Solo se marca CAIDO ante 5xx, timeout
+    o error de conexion.
     """
-    r = _get("Deudas/00000000000")
-    disponible = ("_error" not in r) or ("Parametro" in str(r.get("_detalle", "")))
+    r = _probe(f"Deudas/{CUIT_SONDA}")
+    status = r.get("_status")
+
+    if r.get("_fallo") == "timeout":
+        disponible = False
+        diagnostico = f"CAIDO: el BCRA no respondio dentro de {TIMEOUT:.0f} segundos."
+    elif r.get("_fallo") == "conexion":
+        disponible = False
+        diagnostico = "CAIDO: no se pudo establecer conexion con la API del BCRA."
+    elif status is not None and status >= 500:
+        disponible = False
+        diagnostico = f"CAIDO: el BCRA devolvio HTTP {status} (error del servidor)."
+    elif status == 200:
+        disponible = True
+        diagnostico = "OK: la API responde y acepta consultas."
+    elif status == 404:
+        disponible = True
+        diagnostico = (
+            "OK: la API responde. El CUIT de sonda no registra deuda informada, "
+            "que es la respuesta esperada."
+        )
+    elif status == 400:
+        disponible = True
+        diagnostico = (
+            "OK: la API responde y aplica su validacion de parametros. "
+            "El servicio esta operativo."
+        )
+    else:
+        disponible = True
+        diagnostico = f"La API respondio HTTP {status}. Servicio alcanzable."
+
     return {
         "servicio": "BCRA - Central de Deudores v1.0",
         "base_url": BASE,
-        "disponible": bool(disponible),
+        "disponible": disponible,
+        "diagnostico": diagnostico,
+        "http_status": status,
+        "latencia_ms": r.get("_latencia_ms"),
         "autenticacion": "No requerida",
         "endpoints": [
             "Deudas/{identificacion} - ultimo periodo informado",
@@ -168,6 +240,7 @@ def bcra_estado() -> dict:
             "Deudas/ChequesRechazados/{identificacion} - cheques rechazados y multas",
         ],
         "respuesta_cruda": r,
+        "_url_sonda": r.get("_url"),
         "_aviso": AVISO,
     }
 
@@ -381,7 +454,7 @@ def bcra_informe_consolidado(identificacion: str) -> dict:
                     "detalle": f"Clasificado en situacion {e.get('situacion_codigo')} - {e.get('situacion')}",
                 })
 
-    if historico.get("tendencia", "").startswith("DETERIORO"):
+    if (historico.get("tendencia") or "").startswith("DETERIORO"):
         alertas.append({"nivel": "ALTO", "detalle": historico["tendencia"]})
 
     ch_res = (cheques.get("resumen") or {})
